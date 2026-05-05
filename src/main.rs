@@ -2,15 +2,15 @@ use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Terminal,
 };
 use std::{
     fs::File,
@@ -22,8 +22,8 @@ use std::{
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// File to open
-    file: String,
+    /// Files to open
+    files: Vec<String>,
 }
 
 /// Modal editing mode
@@ -35,7 +35,9 @@ enum Mode {
 
 /// Application state for the file viewer
 struct AppState {
-    lines: Vec<String>,
+    buffers: Vec<Vec<String>>,
+    buffer_names: Vec<String>,
+    current_buffer: usize,
     cursor_line: usize,
     cursor_col: usize,
     scroll_offset: usize,
@@ -45,9 +47,11 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(lines: Vec<String>) -> Self {
+    fn new(buffers: Vec<Vec<String>>, buffer_names: Vec<String>) -> Self {
         Self {
-            lines,
+            buffers,
+            buffer_names,
+            current_buffer: 0,
             cursor_line: 0,
             cursor_col: 0,
             scroll_offset: 0,
@@ -57,12 +61,23 @@ impl AppState {
         }
     }
 
+    /// Returns a reference to the current buffer's lines
+    fn lines(&self) -> &Vec<String> {
+        &self.buffers[self.current_buffer]
+    }
+
+    /// Returns a mutable reference to the current buffer's lines
+    fn lines_mut(&mut self) -> &mut Vec<String> {
+        &mut self.buffers[self.current_buffer]
+    }
+
     /// Width of the line number gutter (right-aligned, like Vim)
     fn line_num_width(&self) -> usize {
-        if self.lines.is_empty() {
+        let len = self.lines().len();
+        if len == 0 {
             2 // Minimum width for "~" alignment
         } else {
-            self.lines.len().to_string().len().max(1) + 1 // digits + trailing space
+            len.to_string().len().max(1) + 1 // digits + trailing space
         }
     }
 
@@ -91,10 +106,11 @@ impl AppState {
 
     /// Clamp cursor within file bounds after cursor movement
     fn clamp_cursor(&mut self) {
-        if self.cursor_line >= self.lines.len() {
-            self.cursor_line = self.lines.len().saturating_sub(1);
+        let num_lines = self.lines().len();
+        if self.cursor_line >= num_lines {
+            self.cursor_line = num_lines.saturating_sub(1);
         }
-        let line_len = self.lines[self.cursor_line].chars().count();
+        let line_len = self.lines()[self.cursor_line].chars().count();
         if line_len == 0 {
             self.cursor_col = 0;
         } else {
@@ -106,14 +122,28 @@ impl AppState {
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
-    // Read file contents
-    let lines = match read_file(&cli.file) {
-        Ok(lines) => lines,
-        Err(e) => {
-            eprintln!("Error reading file '{}': {}", cli.file, e);
-            std::process::exit(1);
+    // If no files provided, read from stdin or show an error
+    if cli.files.is_empty() {
+        eprintln!("No files provided. Usage: fim <file1> [file2 ...]");
+        std::process::exit(1);
+    }
+
+    // Read all file contents into buffers
+    let mut buffers = Vec::with_capacity(cli.files.len());
+    let mut buffer_names = Vec::with_capacity(cli.files.len());
+
+    for filepath in &cli.files {
+        match read_file(filepath) {
+            Ok(lines) => {
+                buffers.push(lines);
+                buffer_names.push(filepath.clone());
+            }
+            Err(e) => {
+                eprintln!("Error reading file '{}': {}", filepath, e);
+                std::process::exit(1);
+            }
         }
-    };
+    }
 
     // Setup terminal
     enable_raw_mode()?;
@@ -123,7 +153,7 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run the TUI app
-    let result = run_app(&mut terminal, &lines);
+    let result = run_app(&mut terminal, buffers, buffer_names);
 
     // Cleanup
     disable_raw_mode()?;
@@ -141,9 +171,10 @@ fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<String>> {
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    lines: &[String],
+    buffers: Vec<Vec<String>>,
+    buffer_names: Vec<String>,
 ) -> io::Result<()> {
-    let mut state = AppState::new(lines.to_vec());
+    let mut state = AppState::new(buffers, buffer_names);
 
     loop {
         let size = terminal.size()?;
@@ -179,12 +210,7 @@ fn run_app(
 
 fn render(state: &AppState, frame: &mut ratatui::Frame) {
     let area = frame.area();
-    let file_area = Rect::new(
-        area.x,
-        area.y,
-        area.width,
-        area.height.saturating_sub(1),
-    );
+    let file_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
     let cmd_y = area.y.saturating_add(area.height.saturating_sub(1));
     let cmd_area = Rect::new(area.x, cmd_y, area.width, 1);
 
@@ -199,14 +225,14 @@ fn render(state: &AppState, frame: &mut ratatui::Frame) {
     for i in 0..file_area_height {
         let file_line_idx = state.scroll_offset + i;
 
-        if file_line_idx < state.lines.len() {
+        if file_line_idx < state.lines().len() {
             let is_cursor_line = state.mode == Mode::Normal && file_line_idx == state.cursor_line;
 
             // Line number (right-aligned, like Vim)
             let line_num = format!("{:>width$}", file_line_idx + 1, width = line_num_width);
 
             // File content, with horizontal scrolling
-            let content = &state.lines[file_line_idx];
+            let content = &state.lines()[file_line_idx];
             let chars: Vec<char> = content.chars().collect();
             let start = state.scroll_col.min(chars.len());
             let end = (state.scroll_col + content_width).min(chars.len());
@@ -272,28 +298,22 @@ fn handle_normal_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
             state.command_buffer.clear();
         }
         // Down / j: move cursor down (like Vim)
-        KeyCode::Down | KeyCode::Char('j') => {
-            if state.cursor_line + 1 < state.lines.len() {
-                state.cursor_line += 1;
-                state.clamp_cursor();
-            }
+        KeyCode::Down | KeyCode::Char('j') if state.cursor_line + 1 < state.lines().len() => {
+            state.cursor_line += 1;
+            state.clamp_cursor();
         }
         // Up / k: move cursor up (like Vim)
-        KeyCode::Up | KeyCode::Char('k') => {
-            if state.cursor_line > 0 {
-                state.cursor_line -= 1;
-                state.clamp_cursor();
-            }
+        KeyCode::Up | KeyCode::Char('k') if state.cursor_line > 0 => {
+            state.cursor_line -= 1;
+            state.clamp_cursor();
         }
         // Left / h: move cursor left (like Vim)
-        KeyCode::Left | KeyCode::Char('h') => {
-            if state.cursor_col > 0 {
-                state.cursor_col -= 1;
-            }
+        KeyCode::Left | KeyCode::Char('h') if state.cursor_col > 0 => {
+            state.cursor_col -= 1;
         }
         // Right / l: move cursor right (like Vim)
         KeyCode::Right | KeyCode::Char('l') => {
-            let line_len = state.lines[state.cursor_line].chars().count();
+            let line_len = state.lines()[state.cursor_line].chars().count();
             if line_len > 0 && state.cursor_col + 1 < line_len {
                 state.cursor_col += 1;
             }
@@ -311,10 +331,28 @@ fn handle_command_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) -
         KeyCode::Enter => {
             let cmd = std::mem::take(&mut state.command_buffer);
             state.mode = Mode::Normal;
-            if cmd == "q" {
-                return true;
+            match cmd.as_str() {
+                "q" => return true,
+                "bn" => {
+                    if state.current_buffer + 1 < state.buffers.len() {
+                        state.current_buffer += 1;
+                        state.cursor_line = 0;
+                        state.cursor_col = 0;
+                        state.scroll_offset = 0;
+                        state.scroll_col = 0;
+                    }
+                }
+                "bp" => {
+                    if state.current_buffer > 0 {
+                        state.current_buffer -= 1;
+                        state.cursor_line = 0;
+                        state.cursor_col = 0;
+                        state.scroll_offset = 0;
+                        state.scroll_col = 0;
+                    }
+                }
+                _ => {}
             }
-            // Future: support more commands here
         }
         KeyCode::Esc => {
             state.command_buffer.clear();
