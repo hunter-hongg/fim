@@ -30,11 +30,12 @@ struct Cli {
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Normal,
+    Insert,
     Command,
 }
 
 /// Saved cursor and scroll position for a buffer
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct CursorState {
     cursor_line: usize,
     cursor_col: usize,
@@ -42,17 +43,7 @@ struct CursorState {
     scroll_col: usize,
 }
 
-impl Default for CursorState {
-    fn default() -> Self {
-        Self {
-            cursor_line: 0,
-            cursor_col: 0,
-            scroll_offset: 0,
-            scroll_col: 0,
-        }
-    }
-}
-
+#[allow(dead_code)]
 /// Application state for the file viewer
 struct AppState {
     buffers: Vec<Vec<String>>,
@@ -90,6 +81,7 @@ impl AppState {
     }
 
     /// Returns a mutable reference to the current buffer's lines
+    #[allow(dead_code)]
     fn lines_mut(&mut self) -> &mut Vec<String> {
         &mut self.buffers[self.current_buffer]
     }
@@ -152,11 +144,16 @@ impl AppState {
             self.cursor_line = num_lines.saturating_sub(1);
         }
         let line_len = self.lines()[self.cursor_line].chars().count();
-        if line_len == 0 {
-            self.cursor_col = 0;
-        } else {
-            self.cursor_col = self.cursor_col.min(line_len - 1);
-        }
+        self.cursor_col = self.cursor_col.min(line_len);
+    }
+
+    /// Save the current buffer to its file path, overwriting the original file.
+    /// Returns an error message on failure.
+    fn save_current_buffer(&self) -> Result<(), String> {
+        let path = &self.buffer_names[self.current_buffer];
+        let lines = &self.buffers[self.current_buffer];
+        let content = lines.join("\n") + "\n";
+        std::fs::write(path, content).map_err(|e| format!("Failed to write '{}': {}", path, e))
     }
 }
 
@@ -175,7 +172,11 @@ fn main() -> io::Result<()> {
 
     for filepath in &cli.files {
         match read_file(filepath) {
-            Ok(lines) => {
+            Ok(mut lines) => {
+                // Ensure at least one line exists (like Vim behavior for empty files)
+                if lines.is_empty() {
+                    lines.push(String::new());
+                }
                 buffers.push(lines);
                 buffer_names.push(filepath.clone());
             }
@@ -233,14 +234,17 @@ fn run_app(
         })?;
 
         if let Event::Key(key) = event::read()? {
-            if state.mode == Mode::Normal {
-                handle_normal_mode(&mut state, &key);
-                if state.mode == Mode::Command && key.code == KeyCode::Char(':') {
-                    // Already handled
+            match state.mode {
+                Mode::Normal => {
+                    handle_normal_mode(&mut state, &key);
                 }
-            } else {
-                if handle_command_mode(&mut state, &key) {
-                    break;
+                Mode::Insert => {
+                    handle_insert_mode(&mut state, &key);
+                }
+                Mode::Command => {
+                    if handle_command_mode(&mut state, &key) {
+                        break;
+                    }
                 }
             }
         }
@@ -267,7 +271,8 @@ fn render(state: &AppState, frame: &mut ratatui::Frame) {
         let file_line_idx = state.scroll_offset + i;
 
         if file_line_idx < state.lines().len() {
-            let is_cursor_line = state.mode == Mode::Normal && file_line_idx == state.cursor_line;
+            let is_cursor_line = (state.mode == Mode::Normal || state.mode == Mode::Insert)
+                && file_line_idx == state.cursor_line;
 
             // Line number (right-aligned, like Vim)
             let line_num = format!("{:>width$}", file_line_idx + 1, width = line_num_width);
@@ -296,6 +301,14 @@ fn render(state: &AppState, frame: &mut ratatui::Frame) {
                     Style::default().bg(Color::Yellow).fg(Color::Black),
                 ));
                 spans.push(Span::styled(after, Style::default().bg(Color::DarkGray)));
+            } else if is_cursor_line && state.cursor_col == end && state.cursor_col == chars.len() {
+                // Cursor is at the end of the line (past the last character)
+                let before: String = chars[start..end].iter().collect();
+                spans.push(Span::styled(before, Style::default().bg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    " ",
+                    Style::default().bg(Color::Yellow).fg(Color::Black),
+                ));
             } else {
                 let display_content: String = chars[start..end].iter().collect();
                 let line_style = if is_cursor_line {
@@ -320,10 +333,10 @@ fn render(state: &AppState, frame: &mut ratatui::Frame) {
     frame.render_widget(Paragraph::new(rendered_lines), file_area);
 
     // Render the command bar at the bottom
-    let cmd_text = if state.mode == Mode::Command {
-        format!(":{}", state.command_buffer)
-    } else {
-        String::new()
+    let cmd_text = match state.mode {
+        Mode::Command => format!(":{}", state.command_buffer),
+        Mode::Insert => "-- INSERT --".to_string(),
+        Mode::Normal => String::new(),
     };
     let cmd_style = Style::default().bg(Color::Black).fg(Color::White);
     frame.render_widget(
@@ -359,6 +372,62 @@ fn handle_normal_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
                 state.cursor_col += 1;
             }
         }
+        // i: enter insert mode at cursor (like Vim)
+        KeyCode::Char('i') => {
+            state.mode = Mode::Insert;
+        }
+        // I: enter insert mode at beginning of line (before first non-whitespace, like Vim)
+        KeyCode::Char('I') => {
+            let line = &state.lines()[state.cursor_line];
+            let first_non_ws = line.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+            state.cursor_col = first_non_ws;
+            state.mode = Mode::Insert;
+        }
+        // a: enter insert mode after cursor (like Vim)
+        KeyCode::Char('a') => {
+            let line_len = state.lines()[state.cursor_line].chars().count();
+            state.cursor_col = state.cursor_col.saturating_add(1).min(line_len);
+            state.mode = Mode::Insert;
+        }
+        // A: enter insert mode at end of line (like Vim)
+        KeyCode::Char('A') => {
+            state.cursor_col = state.lines()[state.cursor_line].chars().count();
+            state.mode = Mode::Insert;
+        }
+        _ => {}
+    }
+}
+
+fn handle_insert_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) => {
+            let line = &mut state.buffers[state.current_buffer][state.cursor_line];
+            let mut chars: Vec<char> = line.chars().collect();
+            chars.insert(state.cursor_col, c);
+            state.cursor_col += 1;
+            *line = chars.into_iter().collect();
+        }
+        KeyCode::Enter => {
+            let current_line = &state.buffers[state.current_buffer][state.cursor_line];
+            let chars: Vec<char> = current_line.chars().collect();
+            let (before, after) = chars.split_at(state.cursor_col);
+            let new_current: String = before.iter().collect();
+            let new_next: String = after.iter().collect();
+            state.buffers[state.current_buffer][state.cursor_line] = new_current;
+            state.buffers[state.current_buffer].insert(state.cursor_line + 1, new_next);
+            state.cursor_line += 1;
+            state.cursor_col = 0;
+        }
+        KeyCode::Backspace if state.cursor_col > 0 => {
+            let line = &mut state.buffers[state.current_buffer][state.cursor_line];
+            let mut chars: Vec<char> = line.chars().collect();
+            chars.remove(state.cursor_col - 1);
+            state.cursor_col -= 1;
+            *line = chars.into_iter().collect();
+        }
+        KeyCode::Esc => {
+            state.mode = Mode::Normal;
+        }
         _ => {}
     }
 }
@@ -374,6 +443,11 @@ fn handle_command_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) -
             state.mode = Mode::Normal;
             match cmd.as_str() {
                 "q" => return true,
+                "w" => {
+                    if let Err(msg) = state.save_current_buffer() {
+                        eprintln!("{}", msg);
+                    }
+                }
                 "bn" => {
                     let new_idx = state.current_buffer + 1;
                     if new_idx < state.buffers.len() {
@@ -381,8 +455,9 @@ fn handle_command_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) -
                     }
                 }
                 "bp" => {
-                    if state.current_buffer > 0 {
-                        state.switch_to_buffer(state.current_buffer - 1);
+                    let new_idx = state.current_buffer;
+                    if new_idx > 0 {
+                        state.switch_to_buffer(new_idx - 1);
                     }
                 }
                 _ => {}
