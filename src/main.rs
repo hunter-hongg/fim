@@ -376,6 +376,19 @@ fn handle_normal_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
         KeyCode::Char('i') => {
             state.mode = Mode::Insert;
         }
+        // o: open a new line below the current line and enter insert mode (like Vim)
+        KeyCode::Char('o') => {
+            state.buffers[state.current_buffer].insert(state.cursor_line + 1, String::new());
+            state.cursor_line += 1;
+            state.cursor_col = 0;
+            state.mode = Mode::Insert;
+        }
+        // O: open a new line above the current line and enter insert mode (like Vim)
+        KeyCode::Char('O') => {
+            state.buffers[state.current_buffer].insert(state.cursor_line, String::new());
+            state.cursor_col = 0;
+            state.mode = Mode::Insert;
+        }
         // I: enter insert mode at beginning of line (before first non-whitespace, like Vim)
         KeyCode::Char('I') => {
             let line = &state.lines()[state.cursor_line];
@@ -443,9 +456,12 @@ fn handle_command_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) -
             state.mode = Mode::Normal;
             match cmd.as_str() {
                 "q" => return true,
-                "w" => {
+                "w" | "wq" => {
                     if let Err(msg) = state.save_current_buffer() {
                         eprintln!("{}", msg);
+                    }
+                    if cmd == "wq" {
+                        return true;
                     }
                 }
                 "bn" => {
