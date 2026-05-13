@@ -56,6 +56,10 @@ struct AppState {
     buffer_states: Vec<CursorState>,
     mode: Mode,
     command_buffer: String,
+    /// Whether each buffer has unsaved changes (matches buffers index)
+    modified: Vec<bool>,
+    /// Transient error message shown in red on the command bar
+    error_message: Option<String>,
 }
 
 impl AppState {
@@ -72,6 +76,8 @@ impl AppState {
             buffer_states: vec![CursorState::default(); count],
             mode: Mode::Normal,
             command_buffer: String::new(),
+            modified: vec![false; count],
+            error_message: None,
         }
     }
 
@@ -333,12 +339,16 @@ fn render(state: &AppState, frame: &mut ratatui::Frame) {
     frame.render_widget(Paragraph::new(rendered_lines), file_area);
 
     // Render the command bar at the bottom
-    let cmd_text = match state.mode {
-        Mode::Command => format!(":{}", state.command_buffer),
-        Mode::Insert => "-- INSERT --".to_string(),
-        Mode::Normal => String::new(),
+    let (cmd_text, cmd_style) = if let Some(ref err) = state.error_message {
+        (err.clone(), Style::default().bg(Color::Black).fg(Color::Red))
+    } else {
+        let text = match state.mode {
+            Mode::Command => format!(":{}", state.command_buffer),
+            Mode::Insert => "-- INSERT --".to_string(),
+            Mode::Normal => String::new(),
+        };
+        (text, Style::default().bg(Color::Black).fg(Color::White))
     };
-    let cmd_style = Style::default().bg(Color::Black).fg(Color::White);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(cmd_text, cmd_style))),
         cmd_area,
@@ -346,6 +356,8 @@ fn render(state: &AppState, frame: &mut ratatui::Frame) {
 }
 
 fn handle_normal_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
+    // Clear any transient error message on user action
+    state.error_message = None;
     match key.code {
         KeyCode::Char(':') => {
             state.mode = Mode::Command;
@@ -382,12 +394,14 @@ fn handle_normal_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
             state.cursor_line += 1;
             state.cursor_col = 0;
             state.mode = Mode::Insert;
+            state.modified[state.current_buffer] = true;
         }
         // O: open a new line above the current line and enter insert mode (like Vim)
         KeyCode::Char('O') => {
             state.buffers[state.current_buffer].insert(state.cursor_line, String::new());
             state.cursor_col = 0;
             state.mode = Mode::Insert;
+            state.modified[state.current_buffer] = true;
         }
         // I: enter insert mode at beginning of line (before first non-whitespace, like Vim)
         KeyCode::Char('I') => {
@@ -412,6 +426,8 @@ fn handle_normal_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
 }
 
 fn handle_insert_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
+    // Clear any transient error message on user action
+    state.error_message = None;
     match key.code {
         KeyCode::Char(c) => {
             let line = &mut state.buffers[state.current_buffer][state.cursor_line];
@@ -419,6 +435,7 @@ fn handle_insert_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
             chars.insert(state.cursor_col, c);
             state.cursor_col += 1;
             *line = chars.into_iter().collect();
+            state.modified[state.current_buffer] = true;
         }
         KeyCode::Enter => {
             let current_line = &state.buffers[state.current_buffer][state.cursor_line];
@@ -430,6 +447,7 @@ fn handle_insert_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
             state.buffers[state.current_buffer].insert(state.cursor_line + 1, new_next);
             state.cursor_line += 1;
             state.cursor_col = 0;
+            state.modified[state.current_buffer] = true;
         }
         KeyCode::Backspace if state.cursor_col > 0 => {
             let line = &mut state.buffers[state.current_buffer][state.cursor_line];
@@ -437,6 +455,7 @@ fn handle_insert_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
             chars.remove(state.cursor_col - 1);
             state.cursor_col -= 1;
             *line = chars.into_iter().collect();
+            state.modified[state.current_buffer] = true;
         }
         KeyCode::Esc => {
             state.mode = Mode::Normal;
@@ -447,6 +466,8 @@ fn handle_insert_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) {
 
 /// Returns true if the application should exit
 fn handle_command_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) -> bool {
+    // Clear any transient error message on user action
+    state.error_message = None;
     match key.code {
         KeyCode::Char(c) => {
             state.command_buffer.push(c);
@@ -455,10 +476,20 @@ fn handle_command_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) -
             let cmd = std::mem::take(&mut state.command_buffer);
             state.mode = Mode::Normal;
             match cmd.as_str() {
-                "q" => return true,
+                "q" => {
+                    if state.modified[state.current_buffer] {
+                        state.error_message = Some(
+                            "No write since last change (add ! to override)".to_string(),
+                        );
+                    } else {
+                        return true;
+                    }
+                }
                 "w" | "wq" => {
                     if let Err(msg) = state.save_current_buffer() {
-                        eprintln!("{}", msg);
+                        state.error_message = Some(msg);
+                    } else {
+                        state.modified[state.current_buffer] = false;
                     }
                     if cmd == "wq" {
                         return true;
