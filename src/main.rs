@@ -340,7 +340,10 @@ fn render(state: &AppState, frame: &mut ratatui::Frame) {
 
     // Render the command bar at the bottom
     let (cmd_text, cmd_style) = if let Some(ref err) = state.error_message {
-        (err.clone(), Style::default().bg(Color::Black).fg(Color::Red))
+        (
+            err.clone(),
+            Style::default().bg(Color::Black).fg(Color::Red),
+        )
     } else {
         let text = match state.mode {
             Mode::Command => format!(":{}", state.command_buffer),
@@ -478,12 +481,14 @@ fn handle_command_mode(state: &mut AppState, key: &crossterm::event::KeyEvent) -
             match cmd.as_str() {
                 "q" => {
                     if state.modified[state.current_buffer] {
-                        state.error_message = Some(
-                            "No write since last change (add ! to override)".to_string(),
-                        );
+                        state.error_message =
+                            Some("No write since last change (add ! to override)".to_string());
                     } else {
                         return true;
                     }
+                }
+                "q!" => {
+                    return true;
                 }
                 "w" | "wq" => {
                     if let Err(msg) = state.save_current_buffer() {
